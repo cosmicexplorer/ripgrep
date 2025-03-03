@@ -128,7 +128,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "termcolor",
- "walkdir",
+ "walkdir 2.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -212,7 +212,7 @@ dependencies = [
  "memchr",
  "regex-automata",
  "same-file",
- "walkdir",
+ "walkdir 2.5.0 (git+https://github.com/cosmicexplorer/walkdir?rev=573d8aafa6709c2dae08ae85ea709c218f84bb87)",
  "winapi-util",
 ]
 
@@ -375,7 +375,7 @@ dependencies = [
  "serde_json",
  "termcolor",
  "textwrap",
- "walkdir",
+ "walkdir 2.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -468,6 +468,15 @@ name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
+dependencies = [
+ "same-file",
+ "winapi-util",
+]
+
+[[package]]
+name = "walkdir"
+version = "2.5.0"
+source = "git+https://github.com/cosmicexplorer/walkdir?rev=573d8aafa6709c2dae08ae85ea709c218f84bb87#573d8aafa6709c2dae08ae85ea709c218f84bb87"
 dependencies = [
  "same-file",
  "winapi-util",

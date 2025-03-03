@@ -479,71 +479,271 @@ impl DirEntryRaw {
 /// against the max filesize limit. If it exceeds the limit, it is skipped.
 /// * Seventh, if the path has made it this far then it is yielded in the
 /// iterator.
-#[derive(Clone)]
-pub struct WalkBuilder {
-    paths: Vec<PathBuf>,
-    ig_builder: IgnoreBuilder,
+#[derive(Clone, Debug)]
+pub struct WalkBuilder<Sorter = (), Filter = ()> {
+    basic: WalkBuilderBasicOptions,
+    string: WalkBuilderStringOptions,
+    sorter: Sorter,
+    filter: Filter,
+}
+
+impl<Sorter, Filter> AsRef<WalkBuilderBasicOptions>
+    for WalkBuilder<Sorter, Filter>
+{
+    fn as_ref(&self) -> &WalkBuilderBasicOptions {
+        &self.basic
+    }
+}
+
+impl<Sorter, Filter> AsMut<WalkBuilderBasicOptions>
+    for WalkBuilder<Sorter, Filter>
+{
+    fn as_mut(&mut self) -> &mut WalkBuilderBasicOptions {
+        &mut self.basic
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+struct WalkBuilderBasicOptions {
     max_depth: Option<usize>,
     max_filesize: Option<u64>,
     follow_links: bool,
     same_file_system: bool,
-    sorter: Option<Sorter>,
     threads: usize,
-    skip: Option<Arc<Handle>>,
-    filter: Option<Filter>,
 }
 
-#[derive(Clone)]
-enum Sorter {
-    ByName(Arc<dyn Fn(&OsStr, &OsStr) -> Ordering + Send + Sync + 'static>),
-    ByPath(Arc<dyn Fn(&Path, &Path) -> Ordering + Send + Sync + 'static>),
-}
-
-#[derive(Clone)]
-struct Filter(Arc<dyn Fn(&DirEntry) -> bool + Send + Sync + 'static>);
-
-impl std::fmt::Debug for WalkBuilder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WalkBuilder")
-            .field("paths", &self.paths)
-            .field("ig_builder", &self.ig_builder)
-            .field("max_depth", &self.max_depth)
-            .field("max_filesize", &self.max_filesize)
-            .field("follow_links", &self.follow_links)
-            .field("threads", &self.threads)
-            .field("skip", &self.skip)
-            .finish()
+impl WalkBuilderBasicOptions {
+    pub const fn new() -> Self {
+        Self {
+            max_depth: None,
+            max_filesize: None,
+            follow_links: false,
+            same_file_system: false,
+            threads: 0,
+        }
     }
 }
 
-impl WalkBuilder {
+impl Default for WalkBuilderBasicOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Sorter, Filter> AsRef<WalkBuilderStringOptions>
+    for WalkBuilder<Sorter, Filter>
+{
+    fn as_ref(&self) -> &WalkBuilderStringOptions {
+        &self.string
+    }
+}
+
+impl<Sorter, Filter> AsMut<WalkBuilderStringOptions>
+    for WalkBuilder<Sorter, Filter>
+{
+    fn as_mut(&mut self) -> &mut WalkBuilderStringOptions {
+        &mut self.string
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WalkBuilderStringOptions {
+    paths: Vec<PathBuf>,
+    ig_builder: IgnoreBuilder,
+    skip: Option<Arc<Handle>>,
+}
+
+impl WalkBuilderStringOptions {
+    pub fn new() -> Self {
+        Self {
+            paths: Vec::new(),
+            ig_builder: IgnoreBuilder::new(),
+            skip: None,
+        }
+    }
+}
+
+impl Default for WalkBuilderStringOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FilterOptions<Filter>(Filter);
+
+impl<Filter> FilterOptions<Filter> {
+    pub const fn new(filter: Filter) -> Self {
+        Self(filter)
+    }
+}
+
+mod sealed {
+    use super::preprocessing::Filter;
+    use super::{DirEntry, FilterOptions};
+
+    #[doc(hidden)]
+    pub trait Sealed {}
+    impl<'a, S> Sealed for &'a S where S: Sealed {}
+
+    #[doc(hidden)]
+    pub trait FilterExtension: Sealed {
+        const CAN_FILTER: bool;
+        fn allow_entry_ext(&self, entry: &DirEntry) -> bool;
+    }
+
+    impl<'a, S> FilterExtension for &'a S
+    where
+        S: FilterExtension,
+    {
+        const CAN_FILTER: bool = S::CAN_FILTER;
+        #[inline(always)]
+        fn allow_entry_ext(&self, entry: &DirEntry) -> bool {
+            (**self).allow_entry_ext(entry)
+        }
+    }
+
+    impl Sealed for () {}
+    impl FilterExtension for () {
+        const CAN_FILTER: bool = false;
+        #[inline(always)]
+        fn allow_entry_ext(&self, _entry: &DirEntry) -> bool {
+            unreachable!()
+        }
+    }
+
+    impl<F> Sealed for FilterOptions<F> {}
+    impl<F> FilterExtension for FilterOptions<F>
+    where
+        F: Filter,
+    {
+        const CAN_FILTER: bool = true;
+        #[inline(always)]
+        fn allow_entry_ext(&self, entry: &DirEntry) -> bool {
+            let Self(f) = self;
+            f.allow_entry(entry)
+        }
+    }
+}
+
+impl Default for WalkBuilder<(), ()> {
+    fn default() -> Self {
+        Self::blank()
+    }
+}
+
+impl WalkBuilder<(), ()> {
+    #[doc(hidden)]
+    pub fn blank() -> Self {
+        Self {
+            basic: WalkBuilderBasicOptions::new(),
+            string: WalkBuilderStringOptions::new(),
+            sorter: (),
+            filter: (),
+        }
+    }
+
     /// Create a new builder for a recursive directory iterator for the
     /// directory given.
     ///
     /// Note that if you want to traverse multiple different directories, it
     /// is better to call `add` on this builder than to create multiple
     /// `Walk` values.
-    pub fn new<P: AsRef<Path>>(path: P) -> WalkBuilder {
+    pub fn new<P: AsRef<Path>>(path: P) -> Self {
+        let mut ret = Self::blank();
+        ret.add(path);
+        ret
+    }
+}
+
+impl<Filter> WalkBuilder<(), Filter> {
+    fn with_sorter<Sorter>(
+        self,
+        sorter: Sorter,
+    ) -> WalkBuilder<walkdir::SortOptions<Sorter>, Filter> {
+        let Self { basic, string, sorter: (), filter } = self;
         WalkBuilder {
-            paths: vec![path.as_ref().to_path_buf()],
-            ig_builder: IgnoreBuilder::new(),
-            max_depth: None,
-            max_filesize: None,
-            follow_links: false,
-            same_file_system: false,
-            sorter: None,
-            threads: 0,
-            skip: None,
-            filter: None,
+            basic,
+            string,
+            sorter: walkdir::SortOptions::new(sorter),
+            filter,
+        }
+    }
+}
+
+impl<Sorter> WalkBuilder<Sorter, ()> {
+    fn with_filter<Filter>(
+        self,
+        filter: Filter,
+    ) -> WalkBuilder<Sorter, FilterOptions<Filter>> {
+        let Self { basic, string, sorter, filter: () } = self;
+        WalkBuilder {
+            basic,
+            string,
+            sorter,
+            filter: FilterOptions::new(filter),
+        }
+    }
+}
+
+#[doc(hidden)]
+pub mod preprocessing {
+
+    use std::fmt;
+
+    use super::DirEntry;
+
+    pub trait Filter {
+        fn allow_entry(&self, entry: &DirEntry) -> bool;
+    }
+
+    #[derive(Clone)]
+    pub struct FilterFun<F>(F);
+
+    impl<F> FilterFun<F> {
+        pub const fn new(fun: F) -> Self {
+            Self(fun)
         }
     }
 
+    impl<F> From<F> for FilterFun<F>
+    where
+        F: Fn(&DirEntry) -> bool,
+    {
+        fn from(f: F) -> Self {
+            Self::new(f)
+        }
+    }
+
+    impl<F> fmt::Debug for FilterFun<F> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "FilterFun(...)")
+        }
+    }
+
+    impl<F> Filter for FilterFun<F>
+    where
+        F: Fn(&DirEntry) -> bool,
+    {
+        #[inline(always)]
+        fn allow_entry(&self, entry: &DirEntry) -> bool {
+            let Self(f) = self;
+            f(entry)
+        }
+    }
+}
+
+impl<Sorter, Filter> WalkBuilder<Sorter, Filter>
+where
+    Sorter: walkdir::sealed::SortExtension + Clone,
+    Filter: Clone,
+{
     /// Build a new `Walk` iterator.
-    pub fn build(&self) -> Walk {
-        let follow_links = self.follow_links;
-        let max_depth = self.max_depth;
-        let sorter = self.sorter.clone();
+    pub fn build(&self) -> Walk<Sorter, Filter> {
+        let follow_links = self.basic.follow_links;
+        let max_depth = self.basic.max_depth;
         let its = self
+            .string
             .paths
             .iter()
             .map(move |p| {
@@ -552,87 +752,81 @@ impl WalkBuilder {
                 } else {
                     let mut wd = WalkDir::new(p);
                     wd = wd.follow_links(follow_links || p.is_file());
-                    wd = wd.same_file_system(self.same_file_system);
+                    wd = wd.same_file_system(self.basic.same_file_system);
                     if let Some(max_depth) = max_depth {
                         wd = wd.max_depth(max_depth);
                     }
-                    if let Some(ref sorter) = sorter {
-                        match sorter.clone() {
-                            Sorter::ByName(cmp) => {
-                                wd = wd.sort_by(move |a, b| {
-                                    cmp(a.file_name(), b.file_name())
-                                });
-                            }
-                            Sorter::ByPath(cmp) => {
-                                wd = wd.sort_by(move |a, b| {
-                                    cmp(a.path(), b.path())
-                                });
-                            }
-                        }
-                    }
+                    let wd = wd.provide_prepared_sort(self.sorter.clone());
                     (p.to_path_buf(), Some(WalkEventIter::from(wd)))
                 }
             })
             .collect::<Vec<_>>()
             .into_iter();
-        let ig_root = self.ig_builder.build();
+        let ig_root = self.string.ig_builder.build();
         Walk {
             its,
             it: None,
             ig_root: ig_root.clone(),
             ig: ig_root.clone(),
-            max_filesize: self.max_filesize,
-            skip: self.skip.clone(),
+            max_filesize: self.basic.max_filesize,
+            skip: self.string.skip.clone(),
             filter: self.filter.clone(),
         }
     }
+}
 
+impl<Sorter, Filter> WalkBuilder<Sorter, Filter>
+where
+    Filter: Clone,
+{
     /// Build a new `WalkParallel` iterator.
     ///
     /// Note that this *doesn't* return something that implements `Iterator`.
     /// Instead, the returned value must be run with a closure. e.g.,
     /// `builder.build_parallel().run(|| |path| { println!("{path:?}"); WalkState::Continue })`.
-    pub fn build_parallel(&self) -> WalkParallel {
+    pub fn build_parallel(&self) -> WalkParallel<Filter> {
         WalkParallel {
-            paths: self.paths.clone().into_iter(),
-            ig_root: self.ig_builder.build(),
-            max_depth: self.max_depth,
-            max_filesize: self.max_filesize,
-            follow_links: self.follow_links,
-            same_file_system: self.same_file_system,
-            threads: self.threads,
-            skip: self.skip.clone(),
+            paths: self.string.paths.clone().into_iter(),
+            ig_root: self.string.ig_builder.build(),
+            max_depth: self.basic.max_depth,
+            max_filesize: self.basic.max_filesize,
+            follow_links: self.basic.follow_links,
+            same_file_system: self.basic.same_file_system,
+            threads: self.basic.threads,
+            skip: self.string.skip.clone(),
             filter: self.filter.clone(),
         }
     }
+}
 
+impl<Sorter, Filter> WalkBuilder<Sorter, Filter> {
     /// Add a file path to the iterator.
     ///
     /// Each additional file path added is traversed recursively. This should
     /// be preferred over building multiple `Walk` iterators since this
     /// enables reusing resources across iteration.
-    pub fn add<P: AsRef<Path>>(&mut self, path: P) -> &mut WalkBuilder {
-        self.paths.push(path.as_ref().to_path_buf());
+    pub fn add<P: AsRef<Path>>(&mut self, path: P) -> &mut Self {
+        self.string.paths.push(path.as_ref().to_path_buf());
         self
     }
 
     /// The maximum depth to recurse.
     ///
     /// The default, `None`, imposes no depth restriction.
-    pub fn max_depth(&mut self, depth: Option<usize>) -> &mut WalkBuilder {
-        self.max_depth = depth;
+    pub fn max_depth(&mut self, depth: Option<usize>) -> &mut Self {
+        self.basic.max_depth = depth;
         self
     }
 
     /// Whether to follow symbolic links or not.
-    pub fn follow_links(&mut self, yes: bool) -> &mut WalkBuilder {
-        self.follow_links = yes;
+    pub fn follow_links(&mut self, yes: bool) -> &mut Self {
+        self.basic.follow_links = yes;
         self
     }
 
     /// Whether to ignore files above the specified limit.
-    pub fn max_filesize(&mut self, filesize: Option<u64>) -> &mut WalkBuilder {
-        self.max_filesize = filesize;
+    pub fn max_filesize(&mut self, filesize: Option<u64>) -> &mut Self {
+        self.basic.max_filesize = filesize;
         self
     }
 
@@ -642,8 +836,8 @@ impl WalkBuilder {
     ///
     /// The default setting is `0`, which chooses the number of threads
     /// automatically using heuristics.
-    pub fn threads(&mut self, n: usize) -> &mut WalkBuilder {
-        self.threads = n;
+    pub fn threads(&mut self, n: usize) -> &mut Self {
+        self.basic.threads = n;
         self
     }
 
@@ -661,7 +855,7 @@ impl WalkBuilder {
         errs.maybe_push(builder.add(path));
         match builder.build() {
             Ok(gi) => {
-                self.ig_builder.add_ignore(gi);
+                self.string.ig_builder.add_ignore(gi);
             }
             Err(err) => {
                 errs.push(err);
@@ -679,8 +873,8 @@ impl WalkBuilder {
     pub fn add_custom_ignore_filename<S: AsRef<OsStr>>(
         &mut self,
         file_name: S,
-    ) -> &mut WalkBuilder {
-        self.ig_builder.add_custom_ignore_filename(file_name);
+    ) -> &mut Self {
+        self.string.ig_builder.add_custom_ignore_filename(file_name);
         self
     }
 
@@ -689,8 +883,8 @@ impl WalkBuilder {
     /// By default, no override matcher is used.
     ///
     /// This overrides any previous setting.
-    pub fn overrides(&mut self, overrides: Override) -> &mut WalkBuilder {
-        self.ig_builder.overrides(overrides);
+    pub fn overrides(&mut self, overrides: Override) -> &mut Self {
+        self.string.ig_builder.overrides(overrides);
         self
     }
 
@@ -699,8 +893,8 @@ impl WalkBuilder {
     /// By default, no file type matcher is used.
     ///
     /// This overrides any previous setting.
-    pub fn types(&mut self, types: Types) -> &mut WalkBuilder {
-        self.ig_builder.types(types);
+    pub fn types(&mut self, types: Types) -> &mut Self {
+        self.string.ig_builder.types(types);
         self
     }
 
@@ -718,7 +912,7 @@ impl WalkBuilder {
     /// They may still be toggled individually after calling this function.
     ///
     /// This is (by definition) enabled by default.
-    pub fn standard_filters(&mut self, yes: bool) -> &mut WalkBuilder {
+    pub fn standard_filters(&mut self, yes: bool) -> &mut Self {
         self.hidden(yes)
             .parents(yes)
             .ignore(yes)
@@ -730,8 +924,8 @@ impl WalkBuilder {
     /// Enables ignoring hidden files.
     ///
     /// This is enabled by default.
-    pub fn hidden(&mut self, yes: bool) -> &mut WalkBuilder {
-        self.ig_builder.hidden(yes);
+    pub fn hidden(&mut self, yes: bool) -> &mut Self {
+        self.string.ig_builder.hidden(yes);
         self
     }
 
@@ -741,8 +935,8 @@ impl WalkBuilder {
     /// file path given are respected. Otherwise, they are ignored.
     ///
     /// This is enabled by default.
-    pub fn parents(&mut self, yes: bool) -> &mut WalkBuilder {
-        self.ig_builder.parents(yes);
+    pub fn parents(&mut self, yes: bool) -> &mut Self {
+        self.string.ig_builder.parents(yes);
         self
     }
 
@@ -752,8 +946,8 @@ impl WalkBuilder {
     /// supported by search tools such as ripgrep and The Silver Searcher.
     ///
     /// This is enabled by default.
-    pub fn ignore(&mut self, yes: bool) -> &mut WalkBuilder {
-        self.ig_builder.ignore(yes);
+    pub fn ignore(&mut self, yes: bool) -> &mut Self {
+        self.string.ig_builder.ignore(yes);
         self
     }
 
@@ -766,8 +960,8 @@ impl WalkBuilder {
     /// set or is empty, then `$HOME/.config/git/ignore` is used instead.
     ///
     /// This is enabled by default.
-    pub fn git_global(&mut self, yes: bool) -> &mut WalkBuilder {
-        self.ig_builder.git_global(yes);
+    pub fn git_global(&mut self, yes: bool) -> &mut Self {
+        self.string.ig_builder.git_global(yes);
         self
     }
 
@@ -777,8 +971,8 @@ impl WalkBuilder {
     /// man page.
     ///
     /// This is enabled by default.
-    pub fn git_ignore(&mut self, yes: bool) -> &mut WalkBuilder {
-        self.ig_builder.git_ignore(yes);
+    pub fn git_ignore(&mut self, yes: bool) -> &mut Self {
+        self.string.ig_builder.git_ignore(yes);
         self
     }
 
@@ -788,8 +982,8 @@ impl WalkBuilder {
     /// `gitignore` man page.
     ///
     /// This is enabled by default.
-    pub fn git_exclude(&mut self, yes: bool) -> &mut WalkBuilder {
-        self.ig_builder.git_exclude(yes);
+    pub fn git_exclude(&mut self, yes: bool) -> &mut Self {
+        self.string.ig_builder.git_exclude(yes);
         self
     }
 
@@ -798,57 +992,16 @@ impl WalkBuilder {
     ///
     /// When disabled, git-related ignore rules are applied even when searching
     /// outside a git repository.
-    pub fn require_git(&mut self, yes: bool) -> &mut WalkBuilder {
-        self.ig_builder.require_git(yes);
+    pub fn require_git(&mut self, yes: bool) -> &mut Self {
+        self.string.ig_builder.require_git(yes);
         self
     }
 
     /// Process ignore files case insensitively
     ///
     /// This is disabled by default.
-    pub fn ignore_case_insensitive(&mut self, yes: bool) -> &mut WalkBuilder {
-        self.ig_builder.ignore_case_insensitive(yes);
-        self
-    }
-
-    /// Set a function for sorting directory entries by their path.
-    ///
-    /// If a compare function is set, the resulting iterator will return all
-    /// paths in sorted order. The compare function will be called to compare
-    /// entries from the same directory.
-    ///
-    /// This is like `sort_by_file_name`, except the comparator accepts
-    /// a `&Path` instead of the base file name, which permits it to sort by
-    /// more criteria.
-    ///
-    /// This method will override any previous sorter set by this method or
-    /// by `sort_by_file_name`.
-    ///
-    /// Note that this is not used in the parallel iterator.
-    pub fn sort_by_file_path<F>(&mut self, cmp: F) -> &mut WalkBuilder
-    where
-        F: Fn(&Path, &Path) -> Ordering + Send + Sync + 'static,
-    {
-        self.sorter = Some(Sorter::ByPath(Arc::new(cmp)));
-        self
-    }
-
-    /// Set a function for sorting directory entries by file name.
-    ///
-    /// If a compare function is set, the resulting iterator will return all
-    /// paths in sorted order. The compare function will be called to compare
-    /// names from entries from the same directory using only the name of the
-    /// entry.
-    ///
-    /// This method will override any previous sorter set by this method or
-    /// by `sort_by_file_path`.
-    ///
-    /// Note that this is not used in the parallel iterator.
-    pub fn sort_by_file_name<F>(&mut self, cmp: F) -> &mut WalkBuilder
-    where
-        F: Fn(&OsStr, &OsStr) -> Ordering + Send + Sync + 'static,
-    {
-        self.sorter = Some(Sorter::ByName(Arc::new(cmp)));
+    pub fn ignore_case_insensitive(&mut self, yes: bool) -> &mut Self {
+        self.string.ig_builder.ignore_case_insensitive(yes);
         self
     }
 
@@ -860,8 +1013,8 @@ impl WalkBuilder {
     /// Currently, this option is only supported on Unix and Windows. If this
     /// option is used on an unsupported platform, then directory traversal
     /// will immediately return an error and will not yield any entries.
-    pub fn same_file_system(&mut self, yes: bool) -> &mut WalkBuilder {
-        self.same_file_system = yes;
+    pub fn same_file_system(&mut self, yes: bool) -> &mut Self {
+        self.basic.same_file_system = yes;
         self
     }
 
@@ -876,15 +1029,170 @@ impl WalkBuilder {
     /// file.
     ///
     /// This is disabled by default.
-    pub fn skip_stdout(&mut self, yes: bool) -> &mut WalkBuilder {
+    pub fn skip_stdout(&mut self, yes: bool) -> &mut Self {
         if yes {
-            self.skip = stdout_handle().map(Arc::new);
+            self.string.skip = stdout_handle().map(Arc::new);
         } else {
-            self.skip = None;
+            self.string.skip = None;
         }
         self
     }
+}
 
+mod sorter_impls {
+    use std::cmp::Ordering;
+    use std::ffi::OsStr;
+    use std::fmt;
+    use std::path::Path;
+
+    use walkdir::{preprocessing::SortPair, DirEntry};
+
+    pub struct PathSorter<F>(F);
+
+    impl<F> PathSorter<F> {
+        pub const fn new(fun: F) -> Self {
+            Self(fun)
+        }
+    }
+
+    impl<F> From<F> for PathSorter<F>
+    where
+        F: Fn(&Path, &Path) -> Ordering,
+    {
+        fn from(f: F) -> Self {
+            Self::new(f)
+        }
+    }
+
+    impl<F> fmt::Debug for PathSorter<F> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "PathSorter(...)")
+        }
+    }
+
+    impl<F> SortPair for PathSorter<F>
+    where
+        F: Fn(&Path, &Path) -> Ordering,
+    {
+        fn compare_pair(
+            &mut self,
+            lhs: &DirEntry,
+            rhs: &DirEntry,
+        ) -> Ordering {
+            let lhs = lhs.path();
+            let rhs = rhs.path();
+            let Self(f) = self;
+            f(lhs, rhs)
+        }
+    }
+
+    pub struct NameSorter<F>(F);
+
+    impl<F> NameSorter<F> {
+        pub const fn new(fun: F) -> Self {
+            Self(fun)
+        }
+    }
+
+    impl<F> From<F> for NameSorter<F>
+    where
+        F: Fn(&OsStr, &OsStr) -> Ordering,
+    {
+        fn from(f: F) -> Self {
+            Self::new(f)
+        }
+    }
+
+    impl<F> fmt::Debug for NameSorter<F> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "NameSorter(...)")
+        }
+    }
+
+    impl<F> SortPair for NameSorter<F>
+    where
+        F: Fn(&OsStr, &OsStr) -> Ordering,
+    {
+        fn compare_pair(
+            &mut self,
+            lhs: &DirEntry,
+            rhs: &DirEntry,
+        ) -> Ordering {
+            let lhs = lhs.file_name();
+            let rhs = rhs.file_name();
+            let Self(f) = self;
+            f(lhs, rhs)
+        }
+    }
+}
+
+impl<Filter> WalkBuilder<(), Filter> {
+    /// Set a function for sorting directory entries by their path.
+    ///
+    /// If a compare function is set, the resulting iterator will return all
+    /// paths in sorted order. The compare function will be called to compare
+    /// entries from the same directory.
+    ///
+    /// This is like `sort_by_file_name`, except the comparator accepts
+    /// a `&Path` instead of the base file name, which permits it to sort by
+    /// more criteria.
+    ///
+    /// This method will override any previous sorter set by this method or
+    /// by `sort_by_file_name`.
+    ///
+    /// Note that this is not used in the parallel iterator.
+    pub fn sort_by_file_path<F>(
+        self,
+        cmp: F,
+    ) -> WalkBuilder<walkdir::SortOptions<sorter_impls::PathSorter<F>>, Filter>
+    where
+        F: Fn(&Path, &Path) -> Ordering,
+    {
+        self.with_sorter(sorter_impls::PathSorter::new(cmp))
+    }
+
+    #[doc(hidden)]
+    pub fn sort_from_key_extractor<K, F>(
+        self,
+        key: impl Into<K>,
+        cmp: F,
+    ) -> WalkBuilder<
+        walkdir::SortOptions<walkdir::preprocessing::SortKeyFun<F, K>>,
+        Filter,
+    >
+    where
+        K: walkdir::preprocessing::SortKey,
+        for<'k> F: Fn(K::Key<'k>, K::Key<'k>) -> Ordering,
+    {
+        self.with_sorter(walkdir::preprocessing::SortKeyFun::new(
+            cmp,
+            key.into(),
+        ))
+    }
+
+    /// Set a function for sorting directory entries by file name.
+    ///
+    /// If a compare function is set, the resulting iterator will return all
+    /// paths in sorted order. The compare function will be called to compare
+    /// names from entries from the same directory using only the name of the
+    /// entry.
+    ///
+    /// This method will override any previous sorter set by this method or
+    /// by `sort_by_file_path`.
+    ///
+    /// Note that this is not used in the parallel iterator.
+    pub fn sort_by_file_name<F>(
+        self,
+        cmp: F,
+    ) -> WalkBuilder<walkdir::SortOptions<sorter_impls::NameSorter<F>>, Filter>
+    where
+        F: Fn(&OsStr, &OsStr) -> Ordering,
+    {
+        self.with_sorter(sorter_impls::NameSorter::new(cmp))
+    }
+}
+
+impl<Sorter> WalkBuilder<Sorter, ()> {
     /// Yields only entries which satisfy the given predicate and skips
     /// descending into directories that do not satisfy the given predicate.
     ///
@@ -894,12 +1202,25 @@ impl WalkBuilder {
     ///
     /// Note that the errors for reading entries that may not satisfy the
     /// predicate will still be yielded.
-    pub fn filter_entry<P>(&mut self, filter: P) -> &mut WalkBuilder
+    pub fn filter_entry<P>(
+        self,
+        filter: P,
+    ) -> WalkBuilder<Sorter, FilterOptions<preprocessing::FilterFun<P>>>
     where
-        P: Fn(&DirEntry) -> bool + Send + Sync + 'static,
+        P: Fn(&DirEntry) -> bool,
     {
-        self.filter = Some(Filter(Arc::new(filter)));
-        self
+        self.filter_entry_base(filter)
+    }
+
+    #[doc(hidden)]
+    pub fn filter_entry_base<F>(
+        self,
+        filter: impl Into<F>,
+    ) -> WalkBuilder<Sorter, FilterOptions<F>>
+    where
+        F: preprocessing::Filter,
+    {
+        self.with_filter(filter.into())
     }
 }
 
@@ -909,27 +1230,32 @@ impl WalkBuilder {
 /// Only file and directory paths matching the rules are returned. By default,
 /// ignore files like `.gitignore` are respected. The precise matching rules
 /// and precedence is explained in the documentation for `WalkBuilder`.
-pub struct Walk {
-    its: std::vec::IntoIter<(PathBuf, Option<WalkEventIter>)>,
-    it: Option<WalkEventIter>,
+pub struct Walk<Sorter = (), Filter = ()> {
+    its: std::vec::IntoIter<(PathBuf, Option<WalkEventIter<Sorter>>)>,
+    it: Option<WalkEventIter<Sorter>>,
     ig_root: Ignore,
     ig: Ignore,
     max_filesize: Option<u64>,
     skip: Option<Arc<Handle>>,
-    filter: Option<Filter>,
+    filter: Filter,
 }
 
-impl Walk {
+impl Walk<(), ()> {
     /// Creates a new recursive directory iterator for the file path given.
     ///
     /// Note that this uses default settings, which include respecting
     /// `.gitignore` files. To configure the iterator, use `WalkBuilder`
     /// instead.
-    pub fn new<P: AsRef<Path>>(path: P) -> Walk {
+    pub fn new<P: AsRef<Path>>(path: P) -> Self {
         WalkBuilder::new(path).build()
     }
+}
 
-    fn skip_entry(&self, ent: &DirEntry) -> Result<bool, Error> {
+impl<Sorter, Filter> Walk<Sorter, Filter> {
+    fn skip_entry(&self, ent: &DirEntry) -> Result<bool, Error>
+    where
+        Filter: sealed::FilterExtension,
+    {
         if ent.depth() == 0 {
             return Ok(false);
         }
@@ -957,16 +1283,22 @@ impl Walk {
                 &ent.metadata().ok(),
             ));
         }
-        if let Some(Filter(filter)) = &self.filter {
-            if !filter(ent) {
+
+        if Filter::CAN_FILTER {
+            if !self.filter.allow_entry_ext(ent) {
                 return Ok(true);
             }
         }
+
         Ok(false)
     }
 }
 
-impl Iterator for Walk {
+impl<Sorter, Filter> Iterator for Walk<Sorter, Filter>
+where
+    Sorter: walkdir::sealed::SortExtension,
+    Filter: sealed::FilterExtension,
+{
     type Item = Result<DirEntry, Error>;
 
     #[inline(always)]
@@ -1039,15 +1371,20 @@ impl Iterator for Walk {
     }
 }
 
-impl std::iter::FusedIterator for Walk {}
+impl<Sorter, Filter> std::iter::FusedIterator for Walk<Sorter, Filter>
+where
+    Sorter: walkdir::sealed::SortExtension,
+    Filter: sealed::FilterExtension,
+{
+}
 
 /// WalkEventIter transforms a WalkDir iterator into an iterator that more
 /// accurately describes the directory tree. Namely, it emits events that are
 /// one of three types: directory, file or "exit." An "exit" event means that
 /// the entire contents of a directory have been enumerated.
-struct WalkEventIter {
+struct WalkEventIter<Sorter> {
     depth: usize,
-    it: walkdir::IntoIter,
+    it: walkdir::IntoIter<Sorter>,
     next: Option<Result<walkdir::DirEntry, walkdir::Error>>,
 }
 
@@ -1058,13 +1395,19 @@ enum WalkEvent {
     Exit,
 }
 
-impl From<WalkDir> for WalkEventIter {
-    fn from(it: WalkDir) -> WalkEventIter {
+impl<Sorter> From<WalkDir<Sorter>> for WalkEventIter<Sorter>
+where
+    Sorter: walkdir::sealed::SortExtension,
+{
+    fn from(it: WalkDir<Sorter>) -> Self {
         WalkEventIter { depth: 0, it: it.into_iter(), next: None }
     }
 }
 
-impl Iterator for WalkEventIter {
+impl<Sorter> Iterator for WalkEventIter<Sorter>
+where
+    Sorter: walkdir::sealed::SortExtension,
+{
     type Item = walkdir::Result<WalkEvent>;
 
     #[inline(always)]
@@ -1199,7 +1542,7 @@ where
 /// and precedence is explained in the documentation for `WalkBuilder`.
 ///
 /// Unlike `Walk`, this uses multiple threads for traversing a directory.
-pub struct WalkParallel {
+pub struct WalkParallel<Filter> {
     paths: std::vec::IntoIter<PathBuf>,
     ig_root: Ignore,
     max_filesize: Option<u64>,
@@ -1208,10 +1551,13 @@ pub struct WalkParallel {
     same_file_system: bool,
     threads: usize,
     skip: Option<Arc<Handle>>,
-    filter: Option<Filter>,
+    filter: Filter,
 }
 
-impl WalkParallel {
+impl<Filter> WalkParallel<Filter>
+where
+    Filter: sealed::FilterExtension + Send + Sync,
+{
     /// Execute the parallel recursive directory iterator. `mkf` is called
     /// for each thread used for iteration. The function produced by `mkf`
     /// is then in turn called for each visited file path.
@@ -1295,10 +1641,10 @@ impl WalkParallel {
         let quit_now = Arc::new(AtomicBool::new(false));
         let active_workers = Arc::new(AtomicUsize::new(threads));
         let stacks = Stack::new_for_each_thread(threads, stack);
+
         std::thread::scope(|s| {
-            let handles: Vec<_> = stacks
-                .into_iter()
-                .map(|stack| Worker {
+            for stack in stacks.into_iter() {
+                let worker = Worker {
                     visitor: builder.build(),
                     stack,
                     quit_now: quit_now.clone(),
@@ -1307,12 +1653,9 @@ impl WalkParallel {
                     max_filesize: self.max_filesize,
                     follow_links: self.follow_links,
                     skip: self.skip.clone(),
-                    filter: self.filter.clone(),
-                })
-                .map(|worker| s.spawn(|| worker.run()))
-                .collect();
-            for handle in handles {
-                handle.join().unwrap();
+                    filter: &self.filter,
+                };
+                s.spawn(|| worker.run());
             }
         });
     }
@@ -1471,7 +1814,7 @@ impl Stack {
 /// ignore matchers, producing new work and invoking the caller's callback.
 ///
 /// Note that a worker is *both* a producer and a consumer.
-struct Worker<V> {
+struct Worker<V, Filter> {
     /// The caller's callback.
     visitor: V,
     /// A work-stealing stack of work to do.
@@ -1501,12 +1844,27 @@ struct Worker<V> {
     skip: Option<Arc<Handle>>,
     /// A predicate applied to dir entries. If true, the entry and all
     /// children will be skipped.
-    filter: Option<Filter>,
+    filter: Filter,
 }
 
-impl<V> Worker<V>
+/* impl<V, Filter> WorkRunner for Worker<V, Filter> */
+/* where */
+/*     V: ParallelVisitor + panic::UnwindSafe, */
+/*     Filter: sealed::FilterExtension + panic::UnwindSafe, */
+/* { */
+/*     fn run(self) { */
+/*         let handler = self.make_quit_handler(); */
+/*         if let Err(e) = panic::catch_unwind(move || self.do_run()) { */
+/*             handler(); */
+/*             panic::resume_unwind(e) */
+/*         } */
+/*     } */
+/* } */
+
+impl<V, Filter> Worker<V, Filter>
 where
     V: ParallelVisitor,
+    Filter: sealed::FilterExtension,
 {
     /// Runs this worker until there is no more work left to do.
     ///
@@ -1662,12 +2020,11 @@ where
             } else {
                 false
             };
-        let should_skip_filtered =
-            if let Some(Filter(predicate)) = &self.filter {
-                !predicate(&dent)
-            } else {
-                false
-            };
+        let should_skip_filtered = if Filter::CAN_FILTER {
+            !self.filter.allow_entry_ext(&dent)
+        } else {
+            false
+        };
         if !should_skip_filesize && !should_skip_filtered {
             self.send(Work { dent, ignore: ig.clone(), root_device });
         }
@@ -1710,6 +2067,13 @@ where
                     }
                     // Wait for next `Work` or `Quit` message.
                     loop {
+                        // While in this busy loop, also ensure we check for the global quit flag.
+                        // This ensures we don't loop forever if the worker stack that was supposed
+                        // to alert us exited with a panic.
+                        if self.is_quit_now() {
+                            // Repeat quit message to wake up sleeping threads, as above.
+                            return None;
+                        }
                         if let Some(v) = self.recv() {
                             self.activate_worker();
                             value = Some(v);
@@ -1957,7 +2321,14 @@ mod tests {
         }
     }
 
-    fn walk_collect(prefix: &Path, builder: &WalkBuilder) -> Vec<String> {
+    fn walk_collect<Sorter, Filter>(
+        prefix: &Path,
+        builder: &WalkBuilder<Sorter, Filter>,
+    ) -> Vec<String>
+    where
+        Sorter: walkdir::sealed::SortExtension + Clone,
+        Filter: super::sealed::FilterExtension + Clone,
+    {
         let mut paths = vec![];
         for result in builder.build() {
             let dent = match result {
@@ -1974,10 +2345,13 @@ mod tests {
         paths
     }
 
-    fn walk_collect_parallel(
+    fn walk_collect_parallel<Sorter, Filter>(
         prefix: &Path,
-        builder: &WalkBuilder,
-    ) -> Vec<String> {
+        builder: &WalkBuilder<Sorter, Filter>,
+    ) -> Vec<String>
+    where
+        Filter: super::sealed::FilterExtension + Clone + Send + Sync,
+    {
         let mut paths = vec![];
         for dent in walk_collect_entries_parallel(builder) {
             let path = dent.path().strip_prefix(prefix).unwrap();
@@ -1990,7 +2364,12 @@ mod tests {
         paths
     }
 
-    fn walk_collect_entries_parallel(builder: &WalkBuilder) -> Vec<DirEntry> {
+    fn walk_collect_entries_parallel<Sorter, Filter>(
+        builder: &WalkBuilder<Sorter, Filter>,
+    ) -> Vec<DirEntry>
+    where
+        Filter: super::sealed::FilterExtension + Clone + Send + Sync,
+    {
         let dents = Arc::new(Mutex::new(vec![]));
         builder.build_parallel().run(|| {
             let dents = dents.clone();
@@ -2016,7 +2395,14 @@ mod tests {
         TempDir::new().unwrap()
     }
 
-    fn assert_paths(prefix: &Path, builder: &WalkBuilder, expected: &[&str]) {
+    fn assert_paths<Sorter, Filter>(
+        prefix: &Path,
+        builder: &WalkBuilder<Sorter, Filter>,
+        expected: &[&str],
+    ) where
+        Sorter: walkdir::sealed::SortExtension + Clone,
+        Filter: super::sealed::FilterExtension + Clone + Send + Sync,
+    {
         let got = walk_collect(prefix, builder);
         assert_eq!(got, mkpaths(expected), "single threaded");
         let got = walk_collect_parallel(prefix, builder);
