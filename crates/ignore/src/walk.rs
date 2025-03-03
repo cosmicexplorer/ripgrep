@@ -569,6 +569,7 @@ impl Default for WalkBuilderStringOptions {
     }
 }
 
+#[doc(hidden)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FilterOptions<Filter>(Filter);
 
@@ -578,7 +579,8 @@ impl<Filter> FilterOptions<Filter> {
     }
 }
 
-mod sealed {
+#[doc(hidden)]
+pub mod sealed {
     use super::preprocessing::Filter;
     use super::{DirEntry, FilterOptions};
 
@@ -1643,7 +1645,8 @@ where
         let stacks = Stack::new_for_each_thread(threads, stack);
 
         std::thread::scope(|s| {
-            for stack in stacks.into_iter() {
+            let mut tasks = Vec::new();
+            for stack in stacks {
                 let worker = Worker {
                     visitor: builder.build(),
                     stack,
@@ -1655,7 +1658,12 @@ where
                     skip: self.skip.clone(),
                     filter: &self.filter,
                 };
-                s.spawn(|| worker.run());
+                tasks.push(s.spawn(|| worker.run()));
+            }
+            for t in tasks {
+                if let Err(_e) = t.join() {
+                    quit_now.store(true, AtomicOrdering::SeqCst);
+                }
             }
         });
     }
@@ -1846,20 +1854,6 @@ struct Worker<V, Filter> {
     /// children will be skipped.
     filter: Filter,
 }
-
-/* impl<V, Filter> WorkRunner for Worker<V, Filter> */
-/* where */
-/*     V: ParallelVisitor + panic::UnwindSafe, */
-/*     Filter: sealed::FilterExtension + panic::UnwindSafe, */
-/* { */
-/*     fn run(self) { */
-/*         let handler = self.make_quit_handler(); */
-/*         if let Err(e) = panic::catch_unwind(move || self.do_run()) { */
-/*             handler(); */
-/*             panic::resume_unwind(e) */
-/*         } */
-/*     } */
-/* } */
 
 impl<V, Filter> Worker<V, Filter>
 where

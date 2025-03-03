@@ -59,7 +59,8 @@ pub mod gitignore;
 pub mod overrides;
 mod pathutil;
 pub mod types;
-mod walk;
+#[doc(hidden)]
+pub mod walk;
 
 /// Represents an error that can occur when parsing a gitignore file.
 #[derive(Debug)]
