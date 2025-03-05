@@ -1281,6 +1281,9 @@ impl WalkParallel {
         let quit_now = Arc::new(AtomicBool::new(false));
         let active_workers = Arc::new(AtomicUsize::new(threads));
         let stacks = Stack::new_for_each_thread(threads, stack);
+
+        /* Retain panic objects and re-throw them outside the thread scope. */
+        let mut err: Option<Box<dyn std::any::Any + Send>> = None;
         std::thread::scope(|s| {
             let handles: Vec<_> = stacks
                 .into_iter()
@@ -1298,9 +1301,17 @@ impl WalkParallel {
                 .map(|worker| s.spawn(|| worker.run()))
                 .collect();
             for handle in handles {
-                handle.join().unwrap();
+                if let Err(e) = handle.join() {
+                    // Send the quit flag to all remaining workers, which overrides any other work.
+                    quit_now.store(true, AtomicOrdering::SeqCst);
+                    // If any panic occurs, only retain the first.
+                    let _ = err.get_or_insert(e);
+                }
             }
         });
+        if let Some(e) = err {
+            std::panic::resume_unwind(e);
+        }
     }
 
     fn threads(&self) -> usize {
@@ -1693,6 +1704,12 @@ impl<'s> Worker<'s> {
                     }
                     // Wait for next `Work` or `Quit` message.
                     loop {
+                        // While in this busy loop, also ensure we check for the global quit flag.
+                        // This ensures we don't loop forever if the worker stack that was supposed
+                        // to alert us exited with a panic.
+                        if self.is_quit_now() {
+                            return None;
+                        }
                         if let Some(v) = self.recv() {
                             self.activate_worker();
                             value = Some(v);
