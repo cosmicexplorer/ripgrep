@@ -2221,6 +2221,18 @@ mod tests {
         assert!(!dents[0].path_is_symlink());
     }
 
+    #[test]
+    #[should_panic(expected = "oops!")]
+    fn panic_in_parallel() {
+        let td = tmpdir();
+        wfile(td.path().join("foo.txt"), "");
+
+        WalkBuilder::new(td.path())
+            .threads(40)
+            .build_parallel()
+            .run(|| Box::new(|_| panic!("oops!")));
+    }
+
     #[cfg(unix)] // because symlinks on windows are weird
     #[test]
     fn symlink_loop() {
