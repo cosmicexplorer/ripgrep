@@ -1691,11 +1691,9 @@ impl<'s> Worker<'s> {
     fn get_work(&mut self) -> Option<Work> {
         let mut value = self.recv();
         loop {
-            eprintln!("1: asdf");
             // Simulate a priority channel: If quit_now flag is set, we can
             // receive only quit messages.
             if self.is_quit_now() {
-                eprintln!("2: asdf");
                 value = Some(Message::Quit)
             }
             match value {
@@ -1703,7 +1701,6 @@ impl<'s> Worker<'s> {
                     return Some(work);
                 }
                 Some(Message::Quit) => {
-                    eprintln!("3: asdf");
                     // Repeat quit message to wake up sleeping threads, if
                     // any. The domino effect will ensure that every thread
                     // will quit.
@@ -1711,7 +1708,6 @@ impl<'s> Worker<'s> {
                     return None;
                 }
                 None => {
-                    eprintln!("4: asdf");
                     if self.deactivate_worker() == 0 {
                         // If deactivate_worker() returns 0, every worker thread
                         // is currently within the critical section between the
@@ -1724,16 +1720,13 @@ impl<'s> Worker<'s> {
                     }
                     // Wait for next `Work` or `Quit` message.
                     loop {
-                        eprintln!("5: asdf");
                         // While in this busy loop, also ensure we check for the global quit flag.
                         // This ensures we don't loop forever if the worker stack that was supposed
                         // to alert us exited with a panic.
                         if self.is_quit_now() {
-                            eprintln!("6: asdf");
                             return None;
                         }
                         if let Some(v) = self.recv() {
-                            eprintln!("7: asdf");
                             self.activate_worker();
                             value = Some(v);
                             break;
