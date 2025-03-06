@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     ffi::OsStr,
     fs::{self, FileType, Metadata},
-    io,
+    io, panic,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
     sync::Arc,
@@ -1156,6 +1156,14 @@ pub trait ParallelVisitor: Send {
     /// Receives files and directories for the current thread. This is called
     /// once for every directory entry visited by traversal.
     fn visit(&mut self, entry: Result<DirEntry, Error>) -> WalkState;
+
+    #[doc(hidden)]
+    fn visit_safe(&mut self, entry: Result<DirEntry, Error>) -> WalkState
+    where
+        Self: panic::UnwindSafe,
+    {
+        self.visit(entry)
+    }
 }
 
 struct FnBuilder<F> {
@@ -1216,6 +1224,26 @@ impl WalkParallel {
     /// for each thread used for iteration. The function produced by `mkf`
     /// is then in turn called for each visited file path.
     pub fn run<V, F>(self, mkf: F)
+    where
+        V: FnMut(Result<DirEntry, Error>) -> WalkState + Send,
+        F: Fn() -> V,
+    {
+        self.visit(FnBuilder { builder: mkf })
+    }
+
+    #[doc(hidden)]
+    pub fn run2<V, F>(self, mkf: F)
+    where
+        V: FnMut(Result<DirEntry, Error>) -> WalkState
+            + Send
+            + panic::UnwindSafe,
+        F: Fn() -> V,
+    {
+        self.visit(FnBuilder { builder: mkf })
+    }
+
+    #[doc(hidden)]
+    pub fn run3<V, F>(self, mkf: F)
     where
         V: FnMut(Result<DirEntry, Error>) -> WalkState + Send,
         F: Fn() -> V,
@@ -1503,6 +1531,23 @@ struct Worker<V> {
     /// children will be skipped.
     filter: Option<Filter>,
 }
+
+// impl<V> Worker<V>
+// where
+//     V: ParallelVisitor + panic::UnwindSafe,
+// {
+//     /// Runs this worker until there is no more work left to do.
+//     ///
+//     /// The worker will call the caller's callback for all entries that aren't
+//     /// skipped by the ignore matcher.
+//     fn run(mut self) {
+//         while let Some(work) = self.get_work() {
+//             if let WalkState::Quit = self.run_one(work) {
+//                 self.quit_now();
+//             }
+//         }
+//     }
+// }
 
 impl<V> Worker<V>
 where
@@ -2247,7 +2292,7 @@ mod tests {
         WalkBuilder::new(td.path())
             .threads(40)
             .build_parallel()
-            .run(|| Box::new(|_| panic!("oops!")));
+            .run2(|| Box::new(|_| panic!("oops!")));
     }
 
     #[cfg(unix)] // because symlinks on windows are weird
