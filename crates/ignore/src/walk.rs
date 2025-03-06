@@ -1302,14 +1302,25 @@ impl WalkParallel {
         std::thread::scope(|s| {
             let handles: Vec<_> = workers
                 .into_iter()
-                .map(|worker| s.spawn(move || worker.run()))
+                .map(|worker| {
+                    let quit_now = quit_now.clone();
+                    s.spawn(move || {
+                        let mut worker = std::panic::AssertUnwindSafe(worker);
+                        let result =
+                            std::panic::catch_unwind(move || worker.run());
+                        if let Err(e) = result {
+                            // Send the quit flag to all remaining workers, which overrides any
+                            // other work.
+                            quit_now.store(true, AtomicOrdering::SeqCst);
+                            std::panic::resume_unwind(e)
+                        }
+                    })
+                })
                 .collect();
             for handle in handles {
                 if let Err(e) = handle.join() {
                     // If any panic occurs, only retain the first.
                     let _ = err.get_or_insert(e);
-                    // Send the quit flag to all remaining workers, which overrides any other work.
-                    quit_now.store(true, AtomicOrdering::SeqCst);
                 }
             }
         });
@@ -1511,7 +1522,7 @@ impl<'s> Worker<'s> {
     ///
     /// The worker will call the caller's callback for all entries that aren't
     /// skipped by the ignore matcher.
-    fn run(mut self) {
+    fn run(&mut self) {
         while let Some(work) = self.get_work() {
             if let WalkState::Quit = self.run_one(work) {
                 self.quit_now();
